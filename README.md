@@ -29,18 +29,8 @@
 ---
 
 ## 快速开始
-
-```bash
-# 增量读取：代码变了，图跟着变
-python3 scripts/incremental_reader.py --input src/ --output arch.drawio
-
-# 直接生成：YAML 画图
-python3 scripts/layout_generator.py --input diagram.yaml --output arch.drawio
-
-# 导出
-python3 scripts/export_diagram.py --input arch.drawio --format png
-```
-
+需要安装这个vscode插件，这个是基于vscode-drawio这个仓库简单改的，支持在代码处右键跳转并聚焦到节点
+再将skill安装给opencode，claudecode...
 ---
 
 ## 项目结构
@@ -66,13 +56,6 @@ python3 scripts/export_diagram.py --input arch.drawio --format png
 
 ---
 
-## 要求
 
-- Python 3.8+
-- 可选：draw.io CLI（用于 PNG 导出）
-
----
-
-## 许可
 
 MIT
