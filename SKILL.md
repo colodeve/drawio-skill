@@ -19,6 +19,7 @@ drawio文件画架构图，并同步架构图和代码，**绝不手写 XML**—
 | 用户意图 | 工作流 | 详细参考 |
 |---|---|---|
 | "从代码生成图" / "代码变了更新图" | **增量读取** | `references/incremental-workflows.md` — Step 1-6 |
+| "基于 git diff 精准检测代码变更" | **git-diff 模式** | `scripts/incremental_reader.py --git-diff` |
 | "设计新模块" / "从图表生成代码" | **增量写入** | `references/incremental-workflows.md` — 下半部分 |
 | "把这个 YAML 画成图" | **直接生成** | `scripts/layout_generator.py --input --output` |
 | "换个样式/颜色" | 样式预设 | `references/style-presets.md` |
@@ -149,29 +150,12 @@ draw.io XML 中的 `label`/`value` 只影响画布上显示的文本，不影响
 
 ---
 
-## 类型颜色映射
-
-| type | 颜色 | 形状 | 适用文件 |
-|------|------|------|---------|
-| `entry`, `config` | 橙 | rounded | main、index、配置文件 |
-| `service`, `logic` | 蓝 | rounded | 业务逻辑、服务类 |
-| `data`, `model`, `database` | 绿 | cylinder | 数据模型、SQL、GraphQL |
-| `external`, `api` | 红 | hexagon | 外部 API、第三方 |
-| `controller`, `ui` | 紫 | rounded | 控制器、UI 组件 |
-| `infrastructure`, `middleware` | 靛 | rounded | Dockerfile、Makefile、CI 配置 |
-| `gateway` | 金 | rounded | 网关 |
-| `queue` | 黄 | rounded | 消息队列 |
-| `decision` | 橙 | rhombus | 判断节点 |
-
-只写 `type`，脚本自动映射颜色和形状。
-
----
-
 ## 脚本工具参考
 
 | 脚本 | 用途 | 详细参考 |
 |---|---|---|
-| `incremental_reader.py` | 扫描代码变更（git ls-files），增量更新图 | `references/tool-reference.md` + `references/incremental-workflows.md` |
+| `incremental_reader.py` | 扫描代码变更，增量更新图。支持 `--diff`（指纹）和 `--git-diff`（git 精确 diff）两种模式 | `references/tool-reference.md` + `references/incremental-workflows.md` |
+| `git_diff_reader.py` | git diff 封装 + drawio XML diff 解析，被 `--git-diff` 自动调用 | `references/tool-reference.md` |
 | `incremental_writer.py` | 从图生成/更新代码骨架（智能合并） | `references/tool-reference.md` + `references/incremental-workflows.md` |
 | `layout_generator.py` | YAML → drawio XML（布局+边路由+容器节点） | `references/tool-reference.md` |
 | `analyzer.py` | 代码块查找 + 函数级指纹（15+ 语言） | `references/tool-reference.md` |
@@ -192,4 +176,5 @@ draw.io XML 中的 `label`/`value` 只影响画布上显示的文本，不影响
 - **增量优先** → 已有项目用 `preserve_existing: true` patch
 - **文件已存在时不覆盖** → 脚本智能合并 import + method
 - **非代码文件也支持** → Dockerfile、Makefile、CI YAML、SQL、配置文件都会被索引
+- **git-diff 模式** → 用 `--git-diff` 替代 `--diff` 可获得更精确的变更内容（AI 能看到实际的 + 行/- 行），工程项目建议使用此模式
 - **首次使用** → 先读 `references/incremental-workflows.md`

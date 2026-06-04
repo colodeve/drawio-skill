@@ -47,18 +47,29 @@ cat structure.yaml | python3 scripts/layout_generator.py --stdin --output diagra
 ### 用法
 
 ```bash
-# Step 1: 检测变更（输出变更报告 + 建议 patch）
+# 指纹检测（默认）
 python3 scripts/incremental_reader.py --project-root . --existing diagram.drawio --diff
 
-# Step 2: 应用 patch（合并基线 + 变更）
+# Git diff 模式（工程项目推荐）
+python3 scripts/incremental_reader.py --project-root . --existing diagram.drawio --git-diff
+
+# 指定 diff ref（默认 HEAD）
+python3 scripts/incremental_reader.py --project-root . --existing diagram.drawio --git-diff --git-ref HEAD~3
+
+# 应用 patch
 python3 scripts/incremental_reader.py --patch patch.yaml --existing diagram.drawio --output diagram.drawio
-
-# 一键模式（扫描+建议+应用）
-python3 scripts/incremental_reader.py --project-root . --existing diagram.drawio --auto
-
-# 指定扫描范围
-python3 scripts/incremental_reader.py --project-root . --existing diagram.drawio --diff --include '*.py' --exclude tests/
 ```
+
+### `--git-diff` 模式 vs `--diff` 模式
+
+| 维度 | `--diff` | `--git-diff` |
+|------|----------|-------------|
+| 检测方式 | SHA-256 指纹对比 | `git diff` 精确行级 diff |
+| AI 能看懂的 | "文件变了" | "+ function divide(self, a, b):" |
+| 变更分类 | none/cosmetic/structural | 基于 diff 内容的关键词检测 |
+| drawio 变更 | 无 | 解析 XML diff → 新增/删除节点和边 |
+| 需要 git | 否 | 是 |
+| 工程项目推荐 | ❌ | ✅ |
 
 ### 参数
 
@@ -342,9 +353,42 @@ python3 scripts/layout_analyzer.py --drawio diagram.drawio --output report.json 
 
 ---
 
-## `export_diagram.py` — 统一导出
+## `git_diff_reader.py` — Git diff 封装 + drawio XML diff
 
-参见 `references/export-commands.md` 获取完整用法。
+被 `incremental_reader --git-diff` 自动调用，通常不直接使用。
+
+### 提供的能力
+
+```python
+from scripts.git_diff_reader import *
+
+# 检测 git 仓库
+is_git_repo(project_root)  # → bool
+
+# 更改的文件列表
+changed_files(ref="HEAD", project_root=".")  # → ["src/a.py", "src/b.ts"]
+
+# 文件级 diff
+file_diff("src/a.py", "HEAD")        # → unified diff string
+parse_git_diff(diff_str)             # → [{"type":"add","content":"..."}]
+
+# Diff 语义分类
+classify_change_from_diff(diff_str)  # → "structural" | "cosmetic" | "none"
+
+# AI 可读的 diff 摘要
+code_diff_summary("src/a.py", "HEAD")  # → markdown 格式的变更摘要
+
+# Drawio XML diff（对比两个版本的 drawio 文件）
+drawio_diff("diagrams/arch.drawio", "HEAD")
+# → DrawioDiff with added/removed/modified nodes and edges
+
+# 安全分支
+safe_branch(project_root)    # → branch name, 自动 checkout 安全分支
+commit_and_return(project_root, "msg")  # → commit 并切回原分支
+
+# 脏工作区检测
+check_dirty(project_root)   # → bool
+```
 
 ### 基本用法
 

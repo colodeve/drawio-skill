@@ -210,12 +210,19 @@ class IncrementalWriter:
     EXCLUDE_DIRS = {"node_modules", ".git", ".svn", "__pycache__", ".venv", "venv", "dist", "build", ".next", ".turbo", "target", "bin", "obj", "vendor", ".drawio-backups"}
 
     def detect_changes(self, exclude_dirs: Optional[set] = None) -> Dict[str, Any]:
-        """Detect differences between diagram and code."""
+        """Detect differences between diagram and code.
+
+        Returns:
+            missing_code_files: nodes in diagram whose code file doesn't exist on disk
+            deleted_nodes: nodes removed from diagram
+            modified_labels: label changes
+            unmapped_files: files on disk not yet in the diagram
+        """
         changes = {
-            'new_nodes': [],
+            'missing_code_files': [],
             'deleted_nodes': [],
             'modified_labels': [],
-            'orphaned_files': [],
+            'unmapped_files': [],
         }
 
         skip = exclude_dirs or self.EXCLUDE_DIRS
@@ -224,27 +231,31 @@ class IncrementalWriter:
             if node.path:
                 file_to_nodes.setdefault(node.path, []).append(node)
 
+        # Nodes whose code file is missing on disk
         for node in self.diagram_data.nodes:
             if not node.path:
                 continue
             full_path = os.path.join(os.path.dirname(self.drawio_path), node.path)
             if not os.path.exists(full_path):
-                changes['new_nodes'].append({
+                changes['missing_code_files'].append({
                     'id': node.id,
                     'label': node.label,
                     'path': node.path,
                     'type': self._infer_type_from_label(node.label)
                 })
 
+        # Files on disk not yet in the diagram
         for root, dirs, files in os.walk(self.project_root):
             dirs[:] = [d for d in dirs if d not in skip]
             for filename in files:
-                if filename.endswith(('.ts', '.js', '.py', '.java', '.go', '.rs', '.rb', '.php')):
+                if filename.endswith(('.ts', '.js', '.py', '.java', '.go', '.rs', '.rb', '.php',
+                                      '.tsx', '.jsx', '.c', '.cpp', '.h', '.cs', '.kt', '.swift',
+                                      '.dart', '.scala', '.lua', '.sh', '.php')):
                     full_path = os.path.join(root, filename)
                     rel_path = os.path.relpath(full_path, os.path.dirname(self.drawio_path))
                     rel_path = rel_path.replace(os.sep, '/')
                     if rel_path not in file_to_nodes:
-                        changes['orphaned_files'].append(rel_path)
+                        changes['unmapped_files'].append(rel_path)
 
         return changes
 
@@ -270,9 +281,9 @@ class IncrementalWriter:
             'existing_code': self.project_root,
         }
 
-        if changes['new_nodes']:
+        if changes['missing_code_files']:
             scaffold['create_files'] = []
-            for node in changes['new_nodes']:
+            for node in changes['missing_code_files']:
                 lang = self._infer_language(node['path'])
                 scaffold['create_files'].append({
                     'path': node['path'],
@@ -330,7 +341,6 @@ class IncrementalWriter:
                 os.makedirs(backup_dir, exist_ok=True)
                 base_name = os.path.basename(del_path)
                 backup_path = os.path.join(backup_dir, base_name)
-                # Avoid overwriting existing backups
                 counter = 1
                 while os.path.exists(backup_path):
                     name, ext = os.path.splitext(base_name)
@@ -339,9 +349,33 @@ class IncrementalWriter:
                 shutil.move(full_path, backup_path)
                 print(f"Moved to backup: {del_path} -> {os.path.relpath(backup_path, self.project_root)}")
 
+        # Rename files (move + update internal import paths — basic)
+        for rename_op in plan.get('rename_files', []):
+            from_path = rename_op.get('from', '')
+            to_path = rename_op.get('to', '')
+            if not from_path or not to_path:
+                continue
+            from_abs = os.path.join(self.project_root, from_path)
+            to_abs = os.path.join(self.project_root, to_path)
+            if not os.path.exists(from_abs):
+                print(f"Warning: cannot rename, source not found: {from_path}")
+                continue
+            os.makedirs(os.path.dirname(to_abs), exist_ok=True)
+            shutil.move(from_abs, to_abs)
+            print(f"Renamed: {from_path} -> {to_path}")
+            # Optionally update diagram path reference
+            if self.diagram_data:
+                for node in self.diagram_data.nodes:
+                    if node.path == from_path:
+                        node.path = to_path
+                        print(f"  Updated diagram path: {from_path} -> {to_path}")
+
         print(f"\nScaffold applied:")
         print(f"  Created: {len(created)} files")
         print(f"  Modified: {len(modified)} files")
+        renamed_count = len(plan.get('rename_files', []))
+        if renamed_count:
+            print(f"  Renamed: {renamed_count} files")
 
         return True
 
@@ -376,8 +410,8 @@ def main():
         changes = writer.detect_changes(exclude_dirs=writer.EXCLUDE_DIRS | extra_exclude)
         if args.verbose:
             print(f"[verbose] Scanning {args.project_root}")
-            print(f"[verbose] New nodes: {len(changes['new_nodes'])}")
-            print(f"[verbose] Orphaned files: {len(changes['orphaned_files'])}")
+            print(f"[verbose] Missing code files: {len(changes['missing_code_files'])}")
+            print(f"[verbose] Unmapped files: {len(changes['unmapped_files'])}")
 
         if args.diff:
             print("# Diagram-to-Code Changes")

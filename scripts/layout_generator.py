@@ -1379,15 +1379,25 @@ class LayoutEngine:
 
 
 def parse_input(input_path: str) -> DiagramDef:
-    """Parse YAML or JSON input file."""
+    """Parse YAML or JSON input file.
+
+    Only accepts 'create' action (or no action). Rejects 'patch' and 'scaffold'
+    to prevent accidental full overwrites.
+    """
     with open(input_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    # Try YAML first, then JSON
     try:
         data = yaml.safe_load(content)
     except yaml.YAMLError:
         data = json.loads(content)
+
+    action = data.get("action", "create")
+    if action in ("patch", "scaffold"):
+        raise ValueError(
+            f"layout_generator.py does not support action='{action}'. "
+            f"Use incremental_reader.py for patches or incremental_writer.py for scaffolding."
+        )
 
     return _dict_to_diagram(data)
 
@@ -1688,6 +1698,11 @@ def main():
             data = yaml.safe_load(content)
         except yaml.YAMLError:
             data = json.loads(content)
+        action = data.get("action", "create")
+        if action in ("patch", "scaffold"):
+            print(f"Error: action='{action}' is not supported by layout_generator.py. "
+                  f"Use incremental_reader.py for patches.", file=sys.stderr)
+            sys.exit(1)
         diagram_def = _dict_to_diagram(data)
     elif args.input:
         diagram_def = parse_input(args.input)

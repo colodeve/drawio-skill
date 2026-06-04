@@ -6,6 +6,9 @@ Usage:
     # Scan project and detect changes
     python incremental_reader.py --project-root . --existing diagram.drawio --diff
 
+    # Use git diff for engineering-grade change detection
+    python incremental_reader.py --project-root . --existing diagram.drawio --git-diff
+
     # Apply patch to existing diagram
     python incremental_reader.py --patch patch.yaml --existing diagram.drawio --output diagram.drawio
 
@@ -35,6 +38,11 @@ from scripts.layout_generator import (
 )
 from scripts.analyzer import structure_hash, content_hash, classify_change
 from scripts.import_graph import build_import_graph, suggest_edges, compute_project_fingerprints, detect_changed_files
+from scripts.git_diff_reader import (
+    is_git_repo, check_dirty, safe_branch, commit_and_return,
+    changed_files, file_diff, file_content_at_ref,
+    drawio_diff, code_diff_summary, classify_change_from_diff, parse_git_diff
+)
 
 
 class IncrementalReader:
@@ -169,6 +177,97 @@ class IncrementalReader:
         # Build import graph and suggest edges for new nodes
         if changes['new_files'] and self.existing_data:
             self._suggest_edges_from_imports(changes, drawio_dir, current_files)
+
+        return changes
+
+    def scan_git_diff(self, ref: str = "HEAD", include_patterns: List[str] = None,
+                       exclude_patterns: List[str] = None) -> Dict[str, Any]:
+        """Scan changes using git diff for engineering-grade change detection.
+
+        Uses `git diff --name-only` to find changed files, then reads the actual
+        diff content so AI can understand the SEMANTIC meaning of changes
+        (not just "file changed" but "+    def divide(self, a, b):").
+        """
+        if not is_git_repo(self.project_root):
+            return {"error": "Not a git repository. Use --diff instead of --git-diff."}
+
+        drawio_dir = os.path.dirname(os.path.abspath(self.existing_drawio)) if self.existing_drawio else self.project_root
+
+        changes: Dict[str, Any] = {
+            'code_changes': [],
+            'drawio_changes': None,
+            'new_files': [],
+            'deleted_files': [],
+            'modified_files': [],
+            'structural_changes': [],
+            'cosmetic_changes': [],
+            'unchanged_files': [],
+            'orphaned_nodes': [],
+            'suggested_edges': [],
+            'code_diff_summaries': {},
+        }
+
+        all_changed = changed_files(ref, self.project_root)
+        if not all_changed:
+            return changes
+
+        # Classify each changed file
+        for fpath in all_changed:
+            abs_path = os.path.join(self.project_root, fpath)
+
+            # Drawio file
+            if fpath.endswith(".drawio") and self.existing_drawio:
+                ddiff = drawio_diff(
+                    os.path.join(self.project_root, fpath),
+                    ref, self.project_root
+                )
+                changes['drawio_changes'] = {
+                    'file': fpath,
+                    'added_nodes': ddiff.added_nodes,
+                    'removed_nodes': ddiff.removed_nodes,
+                    'modified_nodes': ddiff.modified_nodes,
+                    'added_edges': ddiff.added_edges,
+                    'removed_edges': ddiff.removed_edges,
+                }
+                continue
+
+            # Code file
+            diff_str = file_diff(fpath, ref, self.project_root)
+            if diff_str is None:
+                changes['deleted_files'].append(fpath)
+                continue
+
+            change_type = classify_change_from_diff(diff_str)
+            summary = code_diff_summary(fpath, ref, self.project_root)
+
+            entry = {
+                'path': fpath,
+                'change_type': change_type,
+                'abs_path': abs_path,
+                'diff_summary': summary,
+            }
+
+            if change_type == "structural":
+                changes['structural_changes'].append(fpath)
+                changes['modified_files'].append(entry)
+            elif change_type == "cosmetic":
+                changes['cosmetic_changes'].append(fpath)
+            else:
+                changes['unchanged_files'].append(fpath)
+
+            if summary:
+                changes['code_diff_summaries'][fpath] = summary
+
+        # Check for orphaned nodes (diagram nodes whose file was deleted)
+        if self.existing_data:
+            deleted_set = set(changes['deleted_files'])
+            for node in self.existing_data.nodes:
+                if node.path and node.path in deleted_set:
+                    changes['orphaned_nodes'].append({
+                        'id': node.id,
+                        'label': node.label,
+                        'path': node.path
+                    })
 
         return changes
 
@@ -561,6 +660,9 @@ def main():
     parser.add_argument('--project-root', '-p', default='.', help='Project root directory')
     parser.add_argument('--existing', '-e', help='Existing .drawio file')
     parser.add_argument('--diff', action='store_true', help='Detect changes and output report')
+    parser.add_argument('--git-diff', action='store_true', help='Detect changes via git diff (engineering-grade)')
+    parser.add_argument('--git-ref', default='HEAD', help='Git ref to diff against (default: HEAD)')
+    parser.add_argument('--no-branch', action='store_true', help='Skip auto-branch creation for write operations')
     parser.add_argument('--patch', help='Apply patch YAML file')
     parser.add_argument('--output', '-o', help='Output .drawio file')
     parser.add_argument('--auto', action='store_true', help='Auto mode: scan + suggest + apply')
@@ -596,6 +698,19 @@ def main():
         # Also generate suggested patch
         print("\n# Suggested Patch")
         print(reader.generate_patch_yaml(changes))
+
+    elif args.git_diff:
+        from scripts.git_diff_reader import is_git_repo
+        if not is_git_repo(args.project_root):
+            print("Error: Not a git repository. Use --diff instead.", file=sys.stderr)
+            sys.exit(1)
+        changes = reader.scan_git_diff(ref=args.git_ref)
+        print("# Git Diff Change Report")
+        print(yaml.dump(changes, allow_unicode=True, sort_keys=False))
+        if args.verbose and changes.get('code_diff_summaries'):
+            print("\n# Code Diff Summaries (for AI semantic understanding)")
+            for fpath, summary in changes['code_diff_summaries'].items():
+                print(summary)
 
     elif args.patch:
         output = args.output or args.existing
