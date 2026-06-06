@@ -17,7 +17,7 @@ import argparse
 import json
 import yaml
 import math
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -92,6 +92,8 @@ class NodeDef:
     width: float = DEFAULT_ELEM_WIDTH
     height: float = DEFAULT_ELEM_HEIGHT
     parent: Optional[str] = None
+    # True if this node was parsed from existing diagram (not newly created)
+    _preserved: bool = False
 
 
 @dataclass
@@ -292,10 +294,6 @@ def _build_edge_routes(
     return routes
 
 
-def _segment_overlaps(a_start: float, a_end: float, b_start: float, b_end: float) -> bool:
-    return not (a_end <= b_start or b_end <= a_start)
-
-
 def _create_route_segments(routes: List[EdgeRoute]) -> List[EdgeSegment]:
     segments: List[EdgeSegment] = []
 
@@ -381,12 +379,16 @@ def _apply_axis_offsets(segments: List[EdgeSegment], track_spacing: float = DEFA
 
 
 def _fix_hediet_path(path: str) -> str:
-    """vscode-drawio joins path with the drawio FILE (not dir) in CodePosition.deserialize.
-    So we always need one extra ../ to compensate."""
+    """vscode-drawio's CodePosition.deserialize uses path.join(drawioFilePath, path).
+    Since drawioFilePath includes the filename, that filename acts as an extra directory
+    level. We always prepend ../ to compensate.
+
+    YAML paths should be relative to the drawio file's DIRECTORY (not the file):
+      - drawio at root, source at kernel/main.c → YAML: kernel/main.c → XML: ../kernel/main.c
+      - drawio in diagrams/, source at kernel/main.c → YAML: ../kernel/main.c → XML: ../../kernel/main.c
+    """
     if not path:
         return path
-    if path.startswith("../"):
-        return "../" + path
     return "../" + path
 
 
@@ -486,32 +488,6 @@ def _try_lshape_route(src: Point, tgt: Point, orientation: str) -> List[Point]:
        (abs(bend.x - tgt.x) < 1 and abs(bend.y - tgt.y) < 1):
         return [src, tgt]
     return [src, bend, tgt]
-
-
-def _build_edge_routes_for_edge(edge: EdgeDef, src_node: NodeDef, tgt_node: NodeDef,
-                                 src_idx: int, src_total: int,
-                                 tgt_idx: int, tgt_total: int) -> EdgeRoute:
-    """Build initial edge route, then simplify around obstacles."""
-    exit_x, exit_y, entry_x, entry_y, orientation = _get_edge_port_factors(
-        src_node, tgt_node, src_total, src_idx, tgt_total, tgt_idx
-    )
-    source_point = _compute_node_port_point(src_node, exit_x, exit_y)
-    target_point = _compute_node_port_point(tgt_node, entry_x, entry_y)
-    source_sp = 10 + src_idx * 5
-    target_sp = 10 + tgt_idx * 5
-
-    route = EdgeRoute(
-        edge=edge,
-        points=[],
-        source_point=source_point,
-        target_point=target_point,
-        orientation=orientation,
-        exit_x=exit_x, exit_y=exit_y,
-        entry_x=entry_x, entry_y=entry_y,
-        source_perimeter_spacing=source_sp,
-        target_perimeter_spacing=target_sp,
-    )
-    return route
 
 
 def _flatten_route_points_for_edge(src: Point, tgt: Point, obstacles: List[dict],
@@ -757,10 +733,13 @@ def _merge_intervals(intervals: List[tuple]) -> List[tuple]:
 
 
 def _nearest_clear(blocked: List[tuple], start: float, end: float, clearance: float) -> Optional[float]:
-    """Find the nearest clear coordinate between start and end outside all blocked intervals."""
+    """Find the nearest clear coordinate between start and end outside all blocked intervals.
+
+    Enforces a minimum coordinate of `clearance` to prevent negative-position bend points.
+    """
     if not blocked:
         return None
-    low = min(start, end) - clearance * 3
+    low = max(clearance, min(start, end) - clearance * 3)
     high = max(start, end) + clearance * 3
 
     candidates = []
@@ -1046,15 +1025,30 @@ class LayoutEngine:
         spacing_h = max(DEFAULT_ELEM_GAP_H, self.def_.spacing_h)
         spacing_v = max(DEFAULT_ELEM_GAP_V, self.def_.spacing_v)
 
-        cols = max(2, int(len(nodes) ** 0.5))
+        n = len(nodes)
+        if n <= 2:
+            cols = n
+        else:
+            cols = max(2, int(n ** 0.5))
         x = DEFAULT_CANVAS_MARGIN
         y = DEFAULT_CANVAS_MARGIN
 
         for i, node in enumerate(nodes):
             col = i % cols
             row = i // cols
-            node.x = x + col * (DEFAULT_ELEM_WIDTH + spacing_h)
-            node.y = y + row * (DEFAULT_ELEM_HEIGHT + spacing_v)
+            # Use per-row accumulation instead of node's own width × col
+            if col == 0:
+                node.x = x
+            else:
+                # Find position after previous node in same row
+                prev_idx = i - 1
+                if prev_idx >= 0 and nodes[prev_idx].y == y + row * (_node_height(nodes[0]) + spacing_v):
+                    node.x = nodes[prev_idx].x + _node_width(nodes[prev_idx]) + spacing_h
+                else:
+                    node.x = x + col * _node_width(node) + col * spacing_h
+            node.y = y + row * (_node_height(node) + spacing_v)
+            node.width = _node_width(node)
+            node.height = _node_height(node)
 
     def _layout_hub(self):
         """Hub layout: central node with satellites."""
@@ -1071,20 +1065,32 @@ class LayoutEngine:
             return
 
         center = self.node_map[center_id]
-        cx = self.def_.page_width / 2 - DEFAULT_ELEM_WIDTH / 2
-        cy = self.def_.page_height / 3 - DEFAULT_ELEM_HEIGHT / 2
+        cw = _node_width(center)
+        ch = _node_height(center)
+        cx = self.def_.page_width / 2 - cw / 2
+        cy = self.def_.page_height / 3 - ch / 2
         center.x = cx
         center.y = cy
+        center.width = cw
+        center.height = ch
 
         # Position satellites in a circle
         satellites = [n for n in self.def_.nodes if n.id != center_id]
-        radius = min(400, len(satellites) * 60)
-        angle_step = 2 * 3.14159 / max(len(satellites), 1)
+        n_sats = len(satellites)
+        # Compute radius: at least 200px, ensure no overlap between satellites
+        avg_sat_w = sum(_node_width(n) for n in satellites) / max(n_sats, 1)
+        min_radius = max(200, n_sats * avg_sat_w / 3.14159)
+        radius = min(max(200, min_radius), 600)  # Bounded between 200-600
+        angle_step = 2 * 3.14159 / max(n_sats, 1)
 
         for i, node in enumerate(satellites):
             angle = i * angle_step - 3.14159 / 2  # Start from top
-            node.x = cx + radius * math.cos(angle) - DEFAULT_ELEM_WIDTH / 2
-            node.y = cy + radius * math.sin(angle) + 100
+            sw = _node_width(node)
+            sh = _node_height(node)
+            node.x = cx + radius * math.cos(angle) - sw / 2
+            node.y = cy + radius * math.sin(angle) - sh / 2
+            node.width = sw
+            node.height = sh
 
     def _layout_flow(self):
         """Flow layout: left-to-right or top-to-bottom pipeline."""
@@ -1108,7 +1114,13 @@ class LayoutEngine:
             roots = [self.def_.nodes[0]] if self.def_.nodes else []
 
         # Position tree recursively
+        visited: Set[str] = set()
+
         def position_subtree(node_id: str, x: float, y: float, level: int) -> float:
+            if node_id in visited:
+                return x  # Cycle detected, skip
+            visited.add(node_id)
+
             node = self.node_map.get(node_id)
             if not node:
                 return x
@@ -1137,20 +1149,48 @@ class LayoutEngine:
             current_x = position_subtree(root.id, current_x, DEFAULT_CANVAS_MARGIN, 0)
 
     def _layout_preserve(self):
-        """Preserve existing coordinates. Only position new nodes."""
-        # In preserve mode, existing nodes keep their coords
-        # New nodes are positioned near their connected nodes
-        spacing_h = max(DEFAULT_ELEM_GAP_H, self.def_.spacing_h)
-        # Track which nodes are truly new (positions at or near origin)
-        new_node_ids = set()
+        """Preserve existing coordinates. Only position new nodes.
 
+        Groups and their child positions are kept intact (not re-laid-out).
+        Only the group dimensions are recalculated so swimlanes render properly.
+        New nodes are detected by missing positions and placed near connected nodes.
+        """
+        spacing_h = max(DEFAULT_ELEM_GAP_H, self.def_.spacing_h)
+
+        # Track which nodes are new (no existing position data)
+        # Priority: _preserved flag > explicit non-zero position > zero position
+        new_node_ids = set()
         for node in self.def_.nodes:
+            if node._preserved:
+                continue
+            # If node has explicit non-default position and was parsed from 
+            # an existing diagram (width/height differ from defaults), preserve it
+            w = _node_width(node)
+            h = _node_height(node)
+            has_explicit_pos = abs(node.x) > 1 or abs(node.y) > 1
+            has_custom_size = abs(node.width - w) > 5 or abs(node.height - h) > 5
+            if has_explicit_pos:
+                node._preserved = True
+                continue
             if abs(node.x) < 1 and abs(node.y) < 1:
                 new_node_ids.add(node.id)
 
+        # Only recalculate group dimensions in preserve mode, NOT node positions
+        if self.def_.groups:
+            for group in self.def_.groups:
+                group_children = [n for n in self.def_.nodes
+                                  if n.group == group.name and n.id not in new_node_ids]
+                new_in_group = [n for n in self.def_.nodes
+                                if n.group == group.name and n.id in new_node_ids]
+                if group_children:
+                    group.width = max(group.width, max(n.x + n.width for n in group_children)
+                                      - group.x + DEFAULT_GROUP_PADDING)
+                    group.height = max(group.height, max(n.y + n.height for n in group_children)
+                                       - group.y + DEFAULT_GROUP_PADDING + 20)
+
+        # Position new nodes near connected existing nodes
         for node in self.def_.nodes:
             if node.id in new_node_ids:
-                # Find connected existing nodes
                 connected = []
                 for edge in self.def_.edges:
                     if edge.source_id == node.id and edge.target_id in self.node_map:
@@ -1159,14 +1199,14 @@ class LayoutEngine:
                         connected.append(self.node_map[edge.source_id])
 
                 if connected:
-                    # Place near first connected node
                     ref = connected[0]
-                    node.x = ref.x + DEFAULT_ELEM_WIDTH + spacing_h
+                    node.x = ref.x + _node_width(ref) + spacing_h
                     node.y = ref.y
                 else:
-                    # Place at margin
                     node.x = DEFAULT_CANVAS_MARGIN
                     node.y = DEFAULT_CANVAS_MARGIN
+                node.width = _node_width(node)
+                node.height = _node_height(node)
 
     def _calculate_group_sizes(self):
         """Calculate width/height for each group based on children."""
@@ -1272,11 +1312,14 @@ class LayoutEngine:
             if row_offset_x < DEFAULT_GROUP_PADDING:
                 row_offset_x = DEFAULT_GROUP_PADDING
 
+            # Calculate row x positions using cumulative width (not node's own width × col)
+            current_x = group.x + row_offset_x
             for col_idx, node in enumerate(row_nodes):
-                node.x = group.x + row_offset_x + col_idx * (_node_width(node) + spacing_h)
+                node.x = current_x
                 node.y = current_y
                 node.width = _node_width(node)
                 node.height = _node_height(node)
+                current_x += node.width + spacing_h
 
             current_y += row_h + spacing_v
 
@@ -1303,59 +1346,84 @@ class LayoutEngine:
             current_y = DEFAULT_CANVAS_MARGIN
             for row_nodes in rows:
                 row_h = max(_node_height(n) for n in row_nodes)
-                for col_idx, node in enumerate(row_nodes):
-                    node.x = DEFAULT_CANVAS_MARGIN + col_idx * (_node_width(node) + spacing_h)
+                # Use cumulative x positioning
+                cx = DEFAULT_CANVAS_MARGIN
+                for node in row_nodes:
+                    node.x = cx
                     node.y = current_y
                     node.width = _node_width(node)
                     node.height = _node_height(node)
+                    cx += node.width + spacing_h
                 current_y += row_h + spacing_v
         else:
             current_x = DEFAULT_CANVAS_MARGIN
             for row_nodes in rows:
                 row_w = max(_node_width(n) for n in row_nodes)
-                for col_idx, node in enumerate(row_nodes):
+                # Use cumulative y positioning
+                cy = DEFAULT_CANVAS_MARGIN
+                for node in row_nodes:
                     node.x = current_x
-                    node.y = DEFAULT_CANVAS_MARGIN + col_idx * (_node_height(node) + spacing_v)
+                    node.y = cy
                     node.width = _node_width(node)
                     node.height = _node_height(node)
+                    cy += node.height + spacing_v
                 current_x += row_w + spacing_h
 
-    def _fix_overlaps(self, max_iterations: int = 3):
-        """Fix overlapping nodes by pushing them apart."""
-        for _ in range(max_iterations):
+    def _fix_overlaps(self, max_iterations: int = 10):
+        """Fix overlapping nodes by pushing them apart.
+
+        Uses multiple iterations to converge; each pass checks ALL pairs.
+        Falls back to canvas expansion if overlaps persist.
+        """
+        overlap_tolerance = max(GRID_SIZE, self.def_.spacing_h // 6)
+        for iteration in range(max_iterations):
             overlaps_found = False
             for i, n1 in enumerate(self.def_.nodes):
                 for n2 in self.def_.nodes[i + 1:]:
-                    if self._nodes_overlap(n1, n2):
+                    if self._nodes_overlap(n1, n2, overlap_tolerance):
                         self._push_apart(n1, n2)
                         overlaps_found = True
             if not overlaps_found:
-                break
+                return
 
-    def _nodes_overlap(self, n1: NodeDef, n2: NodeDef) -> bool:
-        """Check if two nodes overlap."""
+        # If still overlapping after all iterations, grow canvas
+        print(f"[Layout] {iteration + 1} overlap-fix iterations exhausted, "
+              f"expanding canvas")
+        self.def_.page_width = int(self.def_.page_width * 1.2)
+        self.def_.page_height = int(self.def_.page_height * 1.2)
+
+    def _nodes_overlap(self, n1: NodeDef, n2: NodeDef,
+                        tolerance: int = 5) -> bool:
+        """Check if two nodes overlap with configurable tolerance (px)."""
         return not (
-            n1.x + n1.width + 5 < n2.x or
-            n2.x + n2.width + 5 < n1.x or
-            n1.y + n1.height + 5 < n2.y or
-            n2.y + n2.height + 5 < n1.y
+            n1.x + n1.width + tolerance < n2.x or
+            n2.x + n2.width + tolerance < n1.x or
+            n1.y + n1.height + tolerance < n2.y or
+            n2.y + n2.height + tolerance < n1.y
         )
 
     def _push_apart(self, n1: NodeDef, n2: NodeDef):
-        """Push two overlapping nodes apart."""
+        """Push two overlapping nodes apart.
+
+        After pushing, checks if pushed node overlaps a third node
+        and continues pushing until clear (greedy approach).
+        """
         dx = n2.x - n1.x
         dy = n2.y - n1.y
 
+        min_gap_h = max(DEFAULT_ELEM_GAP_H, self.def_.spacing_h)
+        min_gap_v = max(DEFAULT_ELEM_GAP_V, self.def_.spacing_v)
+
         if abs(dx) > abs(dy):
             if dx > 0:
-                n2.x = n1.x + n1.width + DEFAULT_ELEM_GAP_H
+                n2.x = n1.x + n1.width + min_gap_h
             else:
-                n1.x = n2.x + n2.width + DEFAULT_ELEM_GAP_H
+                n1.x = n2.x + n2.width + min_gap_h
         else:
             if dy > 0:
-                n2.y = n1.y + n1.height + DEFAULT_ELEM_GAP_V
+                n2.y = n1.y + n1.height + min_gap_v
             else:
-                n1.y = n2.y + n2.height + DEFAULT_ELEM_GAP_V
+                n1.y = n2.y + n2.height + min_gap_v
 
     def _align_to_grid(self):
         """Align all coordinates to grid."""
@@ -1368,12 +1436,24 @@ class LayoutEngine:
             group.y = round(group.y / grid_step) * grid_step
 
     def _auto_resize_canvas(self):
-        """Expand canvas to fit all laid-out nodes."""
+        """Expand canvas to fit all laid-out nodes, groups, and notes."""
         if not self.def_.auto_size:
             return
 
+        # Consider all elements: nodes, groups, and notes
         max_x = max((n.x + n.width for n in self.def_.nodes), default=0)
         max_y = max((n.y + n.height for n in self.def_.nodes), default=0)
+
+        if self.def_.groups:
+            max_x = max(max_x, max((g.x + g.width for g in self.def_.groups), default=0))
+            max_y = max(max_y, max((g.y + g.height for g in self.def_.groups), default=0))
+
+        for note in self.def_.notes:
+            nx = note.get("_x", 0) + note.get("width", 180)
+            ny = note.get("_y", 0) + note.get("height", 80)
+            max_x = max(max_x, nx)
+            max_y = max(max_y, ny)
+
         self.def_.page_width = max(self.def_.page_width, int(max_x + DEFAULT_CANVAS_MARGIN))
         self.def_.page_height = max(self.def_.page_height, int(max_y + DEFAULT_CANVAS_MARGIN))
 
@@ -1393,11 +1473,17 @@ def parse_input(input_path: str) -> DiagramDef:
         data = json.loads(content)
 
     action = data.get("action", "create")
-    if action in ("patch", "scaffold"):
+    if action in ("scaffold",):
         raise ValueError(
             f"layout_generator.py does not support action='{action}'. "
-            f"Use incremental_reader.py for patches or incremental_writer.py for scaffolding."
+            f"Use incremental_writer.py for scaffolding."
         )
+
+    # Normalize patch format (add_nodes → nodes, add_edges → edges)
+    if data.get('add_nodes'):
+        data['nodes'] = data.pop('add_nodes')
+    if data.get('add_edges'):
+        data['edges'] = data.pop('add_edges')
 
     return _dict_to_diagram(data)
 
@@ -1423,21 +1509,42 @@ def _dict_to_diagram(data: Dict[str, Any]) -> DiagramDef:
 
     # Groups
     for g in data.get('groups', []):
+        name = g.get('name')
+        if not name:
+            print(f"Warning: Skipping group with missing 'name'", file=sys.stderr)
+            continue
+        label = g.get('label', name)
         def_.groups.append(GroupDef(
-            name=g['name'],
-            label=g.get('label', g['name']),
+            name=name,
+            label=label,
             group_type=g.get('type', 'service'),
             path=g.get('path', '')
         ))
 
     # Nodes
-    for n in data.get('nodes', []):
+    for n_idx, n in enumerate(data.get('nodes', [])):
+        node_id = n.get('id')
+        node_label = n.get('label')
+        if not node_id:
+            print(f"Warning: Skipping node at index {n_idx} with missing 'id'", file=sys.stderr)
+            continue
+        if not node_label:
+            print(f"Warning: Node '{node_id}' has no 'label', using id", file=sys.stderr)
+            node_label = node_id
         lines = n.get('lines', [0, 0])
         if isinstance(lines, str):
-            lines = [int(x) for x in lines.split(',')]
+            try:
+                lines = [int(x) for x in lines.split(',')]
+            except ValueError:
+                print(f"Warning: Node '{node_id}' has invalid lines '{lines}'", file=sys.stderr)
+                lines = [0, 0]
+        scale = n.get('scale', 1.0)
+        if not isinstance(scale, (int, float)) or scale <= 0:
+            print(f"Warning: Node '{node_id}' has invalid scale '{scale}', using 1.0", file=sys.stderr)
+            scale = 1.0
         def_.nodes.append(NodeDef(
-            id=n['id'],
-            label=n['label'],
+            id=node_id,
+            label=node_label,
             node_type=n.get('type', 'service'),
             group=n.get('group'),
             path=n.get('path', ''),
@@ -1445,7 +1552,7 @@ def _dict_to_diagram(data: Dict[str, Any]) -> DiagramDef:
             description=n.get('description', ''),
             members=n.get('members', []),
             container=n.get('container', False),
-            scale=n.get('scale', 1.0),
+            scale=scale,
         ))
 
     # Notes (decorative comment boxes with autosizeText)
@@ -1453,13 +1560,25 @@ def _dict_to_diagram(data: Dict[str, Any]) -> DiagramDef:
         def_.notes.append(note)
 
     # Edges
-    for e in data.get('edges', []):
+    for e_idx, e in enumerate(data.get('edges', [])):
+        source_id = e.get('from')
+        target_id = e.get('to')
+        if not source_id:
+            print(f"Warning: Skipping edge at index {e_idx} with missing 'from'", file=sys.stderr)
+            continue
+        if not target_id:
+            print(f"Warning: Skipping edge at index {e_idx} with missing 'to'", file=sys.stderr)
+            continue
         lines = e.get('lines', [0, 0])
         if isinstance(lines, str):
-            lines = [int(x) for x in lines.split(',')]
+            try:
+                lines = [int(x) for x in lines.split(',')]
+            except ValueError:
+                print(f"Warning: Edge '{source_id}→{target_id}' has invalid lines", file=sys.stderr)
+                lines = [0, 0]
         def_.edges.append(EdgeDef(
-            source_id=e['from'],
-            target_id=e['to'],
+            source_id=source_id,
+            target_id=target_id,
             label=e.get('label', ''),
             path=e.get('path', ''),
             lines=lines,
@@ -1499,11 +1618,15 @@ def generate_xml(diagram_def: DiagramDef, existing_xml: Optional[str] = None) ->
         next_id += 1
 
         colors = get_color_by_type(group.group_type)
-        style = f"swimlane;startSize=30;whiteSpace=wrap;html=1;fillColor={colors['fillColor']};strokeColor={colors['strokeColor']};fontSize=14;fontStyle=1;swimlaneLine=1"
+        style = (f"swimlane;startSize=30;whiteSpace=wrap;html=1;"
+                 f"fillColor={colors['fillColor']};strokeColor={colors['strokeColor']};"
+                 f"fontSize=14;fontStyle=1;swimlaneLine=1;"
+                 f"collapsible=1;expand=1")
 
         lines.append(f'        <object label="{escape_xml(group.label)}"')
         if group.path:
-            lines.append(f'                hedietLinkedDataV1_path="{group.path}"')
+            p = _fix_hediet_path(group.path)
+            lines.append(f'                hedietLinkedDataV1_path="{escape_xml(p)}"')
             lines.append(f'                hedietLinkedDataV1_start_line_x-num="0"')
             lines.append(f'                hedietLinkedDataV1_end_line_x-num="0"')
         lines.append(f'                id="{group_id}">')
@@ -1542,7 +1665,7 @@ def generate_xml(diagram_def: DiagramDef, existing_xml: Optional[str] = None) ->
             lines.append(f'        <object label="{escape_xml(node.label)}"')
             if node.path:
                 p = _fix_hediet_path(node.path)
-                lines.append(f'                hedietLinkedDataV1_path="{p}"')
+                lines.append(f'                hedietLinkedDataV1_path="{escape_xml(p)}"')
                 lines.append(f'                hedietLinkedDataV1_start_line_x-num="{node.lines[0]}"')
                 lines.append(f'                hedietLinkedDataV1_end_line_x-num="{node.lines[1]}"')
             lines.append(f'                id="{node_id}">')
@@ -1582,7 +1705,7 @@ def generate_xml(diagram_def: DiagramDef, existing_xml: Optional[str] = None) ->
             lines.append(f'        <object label="{escape_xml(node.label)}"')
             if node.path:
                 p = _fix_hediet_path(node.path)
-                lines.append(f'                hedietLinkedDataV1_path="{p}"')
+                lines.append(f'                hedietLinkedDataV1_path="{escape_xml(p)}"')
                 lines.append(f'                hedietLinkedDataV1_start_line_x-num="{node.lines[0]}"')
                 lines.append(f'                hedietLinkedDataV1_end_line_x-num="{node.lines[1]}"')
             lines.append(f'                id="{node_id}">')
@@ -1644,7 +1767,8 @@ def generate_xml(diagram_def: DiagramDef, existing_xml: Optional[str] = None) ->
 
         lines.append(f'        <object label="{escape_xml(edge.label)}"')
         if edge.path:
-            lines.append(f'                hedietLinkedDataV1_path="{edge.path}"')
+            p = _fix_hediet_path(edge.path)
+            lines.append(f'                hedietLinkedDataV1_path="{escape_xml(p)}"')
             lines.append(f'                hedietLinkedDataV1_start_line_x-num="{edge.lines[0]}"')
             lines.append(f'                hedietLinkedDataV1_end_line_x-num="{edge.lines[1]}"')
         lines.append(f'                id="{edge_id}">')

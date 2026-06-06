@@ -290,6 +290,7 @@ layout:
   algorithm: layered        # layered | grid | hub | flow | tree | preserve
   direction: top-to-bottom  # left-to-right | bottom-to-top | right-to-left
   preserve_existing: true   # patch 模式下保留未变更节点位置
+  auto_size: true           # 自动扩展画布适应节点（默认 true）
   spacing:                  # 间距覆写（可选）
     horizontal: 60
     vertical: 80
@@ -303,19 +304,21 @@ layout:
 
 | 算法 | 适用场景 | 说明 |
 |------|---------|------|
-| `layered` | 架构图（默认） | 分层排列，top-to-bottom |
+| `layered` | **架构图（强烈推荐）** | 分层排列，配合 `top-to-bottom` 为竖版泳道布局 |
 | `grid` | 模块地图 | 网格排列 |
 | `hub` | 微服务 | 中心节点 + 周边节点 |
 | `flow` | 数据流 | 等同于 layered |
 | `tree` | 类层次 | 递归树形排列 |
-| `preserve` | 增量更新 | 保持已有坐标，只排新增节点 |
+| `preserve` | 增量更新 | 保持已有坐标，只排新增节点（group 模式下仍会自动重算 swimlane） |
 
 ### direction
 
-- `top-to-bottom` — 数据流向下（默认）
-- `left-to-right` — 流程向右
+- **`top-to-bottom`** — **竖版分层（默认推荐）**。数据流/控制流从上到下，契合阅读习惯，适合 5+ 节点的架构图
+- `left-to-right` — 横版流程图。仅推荐用于简单的线性流程（≤5 节点）
 - `bottom-to-top` — 逆向分层
 - `right-to-left` — 逆向流程
+
+> **布局建议**：节点数 > 5 时，**强烈建议使用 `layered` + `top-to-bottom` + `nodes[].group` 分组**。横版扁平布局在节点增多时会严重拉伸画布、边路由混乱、语义层次丢失。竖版 swimlane 架构图是当前 skill 的默认最佳实践。
 
 ---
 

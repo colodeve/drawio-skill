@@ -15,14 +15,13 @@ draw.io diagrams.
 | `ELEM_GAP_H` | `DEFAULT_ELEM_GAP_H` | 60 | Horizontal gap between nodes in a row |
 | `ELEM_GAP_V` | `DEFAULT_ELEM_GAP_V` | 90 | Vertical gap between rows |
 | `GROUP_PADDING` | `DEFAULT_GROUP_PADDING` | 30 | Internal padding within a group (left/right) |
-| `GROUP_TOP_PAD` | `DEFAULT_GROUP_TOP_PAD` | 50 | Top padding inside group (accounts for header) |
-| `GROUP_GAP_H` | `DEFAULT_GROUP_GAP_H` | 120 | Horizontal gap between groups |
-| `GROUP_GAP_V` | `DEFAULT_GROUP_GAP_V` | 160 | Vertical gap between groups |
-| `CANVAS_MARGIN` | `DEFAULT_CANVAS_MARGIN` | 50 | Margin from canvas edge to first group |
-| `EDGE_CLEARANCE` | `EDGE_CLEARANCE` | 20 | Clearance for obstacle-aware edge routing |
-| `ROUTE_SPACING` | `DEFAULT_ROUTE_TRACK_SPACING` | 16 | Edge segment offset when multiple edges share same coordinate |
+| `GROUP_TOP_PAD` | `DEFAULT_GROUP_TOP_PAD` | 50 | Top padding inside group (accounts for header). Note: draw.io `startSize=30` controls the swimlane header height. `GROUP_TOP_PAD=50` includes the 30px header + 20px extra padding before the first child node. |
 
 > Values shown are defaults. All are overridable via YAML `layout.spacing.*`.
+
+> **关于 GROUP_TOP_PAD 与 startSize 的关系**：draw.io 的 `startSize=30` 控制 swimlane 标题栏高度。
+> 布局引擎的 `GROUP_TOP_PAD=50` = `startSize(30) + 20px 额外间距`，因此子节点从 y=50 开始排列而非 y=30。
+> 这个 20px 额外间距是固定值，不由配置控制。
 
 ---
 

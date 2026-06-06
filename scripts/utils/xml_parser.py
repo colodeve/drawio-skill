@@ -83,9 +83,19 @@ class XmlParser:
         self.tree: Optional[ET.ElementTree] = None
         self.root: Optional[ET.Element] = None
         self.namespace = {"mx": "http://draw.io.mxgraph.org/mxgraph"}
+        self._data: Optional[DiagramData] = None
 
         if drawio_file and os.path.exists(drawio_file):
             self.load(drawio_file)
+
+    @property
+    def nodes(self) -> List[NodeInfo]:
+        return self._data.nodes if self._data else []
+
+    @nodes.setter
+    def nodes(self, value: List[NodeInfo]):
+        if self._data:
+            self._data.nodes = value
 
     def load(self, drawio_file: str) -> DiagramData:
         """Load and parse a drawio XML file."""
@@ -100,9 +110,22 @@ class XmlParser:
         self.root = self.tree.getroot()
         return self.parse()
 
+    def _local_tag(self, tag_name: str) -> str:
+        """Get local tag name (strip namespace)."""
+        return tag_name.split("}")[-1] if "}" in tag_name else tag_name
+
+    def _find_geom(self, cell: ET.Element) -> Optional[ET.Element]:
+        """Find mxGeometry child, handling both namespaced and non-namespaced XML."""
+        for child in cell.iter():
+            local = self._local_tag(child.tag)
+            if local == "mxGeometry":
+                return child
+        return None
+
     def parse(self) -> DiagramData:
         """Parse the loaded XML and extract diagram data."""
         data = DiagramData(source_file=self.drawio_file)
+        self._data = data
 
         if self.root is None:
             return data
@@ -113,8 +136,14 @@ class XmlParser:
 
         cells = self._find_all_cells()
         for cell in cells:
-            cell_type = cell.get("cellType", "vertex")
-            if cell_type == "edge":
+            # draw.io uses edge="1" for edges, vertex="1" for vertices
+            # For <object> elements, the edge attribute is on the inner mxCell
+            is_edge = cell.get("edge") == "1"
+            if not is_edge:
+                inner = cell.find(".//mxCell")
+                if inner is not None:
+                    is_edge = inner.get("edge") == "1"
+            if is_edge:
                 edge = self._parse_edge(cell)
                 if edge:
                     data.edges.append(edge)
@@ -164,17 +193,30 @@ class XmlParser:
                     pass
 
     def _find_all_cells(self) -> List[ET.Element]:
-        """Find all cell elements (mxCell and object tags)."""
+        """Find all cell elements (mxCell and object tags).
+        Skips mxCell elements that are wrapped inside <object> tags
+        (they are handled via their parent <object>)."""
+        # Build parent map once for efficiency
+        parent_map = {}
+        if self.root is not None:
+            for parent in self.root.iter():
+                for child in parent:
+                    parent_map[id(child)] = parent
+
         cells = []
-
         for elem in self.root.iter() if self.root else []:
-            tag_name = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-            if tag_name in ("mxCell", "object"):
-                cell_id = elem.get("id")
-                # Skip root cells (id=0 and id=1 are internal drawio nodes)
-                if cell_id not in ("0", "1"):
-                    cells.append(elem)
-
+            tag_name = self._local_tag(elem.tag)
+            if tag_name not in ("mxCell", "object"):
+                continue
+            cell_id = elem.get("id")
+            if cell_id in ("0", "1"):
+                continue
+            # Skip mxCells that are inside <object> (they're handled via the object)
+            if tag_name == "mxCell":
+                par = parent_map.get(id(elem))
+                if par is not None and self._local_tag(par.tag) == "object":
+                    continue
+            cells.append(elem)
         return cells
 
     def _parse_vertex(self, cell: ET.Element) -> Optional[NodeInfo]:
@@ -183,8 +225,8 @@ class XmlParser:
         if not cell_id:
             return None
 
-        # Look for mxGeometry in all descendants (handles nested structure)
-        geometry = cell.find(".//mxGeometry")
+        # Look for mxGeometry in all descendants (handles nested structure & namespaces)
+        geometry = self._find_geom(cell)
         if geometry is None:
             x, y, w, h = 0, 0, 100, 60
         else:
@@ -198,21 +240,20 @@ class XmlParser:
         if label:
             label = self._clean_html(label)
 
-        style = cell.get("style", "")
-        parent = cell.get("parent")
-
+        # Get style from inner mxCell (for object) or directly from cell (for bare mxCell)
+        local = self._local_tag(cell.tag)
+        if local == "object":
+            style_cell = cell.find(".//mxCell") or cell
+        else:
+            style_cell = cell
+        style = style_cell.get("style", "")
         path = None
         start_line = None
-        start_col = None
         end_line = None
-        end_col = None
-        symbol = None
-        raw_attrs = {}
 
         for attr in self.HEDIET_ATTRS:
             value = cell.get(attr)
             if value:
-                raw_attrs[attr] = value
                 if attr == "hedietLinkedDataV1_path":
                     path = value
                 elif attr == "hedietLinkedDataV1_start_line_x-num":
@@ -220,23 +261,11 @@ class XmlParser:
                         start_line = int(value)
                     except ValueError:
                         pass
-                elif attr == "hedietLinkedDataV1_start_col_x-num":
-                    try:
-                        start_col = int(value)
-                    except ValueError:
-                        pass
                 elif attr == "hedietLinkedDataV1_end_line_x-num":
                     try:
                         end_line = int(value)
                     except ValueError:
                         pass
-                elif attr == "hedietLinkedDataV1_end_col_x-num":
-                    try:
-                        end_col = int(value)
-                    except ValueError:
-                        pass
-                elif attr == "hedietLinkedDataV1_symbol":
-                    symbol = value
 
         return NodeInfo(
             id=cell_id,
@@ -246,14 +275,14 @@ class XmlParser:
             width=w,
             height=h,
             style=style,
-            parent=parent,
+            parent=cell.get("parent"),
             path=path,
             start_line=start_line,
-            start_col=start_col,
+            start_col=None,
             end_line=end_line,
-            end_col=end_col,
-            symbol=symbol,
-            raw_attributes=raw_attrs
+            end_col=None,
+            symbol=None,
+            raw_attributes={}
         )
 
     def _parse_edge(self, cell: ET.Element) -> Optional[EdgeInfo]:
@@ -262,13 +291,21 @@ class XmlParser:
         if not cell_id:
             return None
 
-        source = cell.get("source")
-        target = cell.get("target")
+        # For <object> wrappers, source/target are on the inner <mxCell>
+        mxcell = cell
+        local = self._local_tag(cell.tag)
+        if local == "object":
+            mxcell = cell.find(".//mxCell")
+            if mxcell is None:
+                return None
+
+        source = mxcell.get("source")
+        target = mxcell.get("target")
         if not source or not target:
             return None
 
-        style = cell.get("style", "")
-        label = cell.get("value", "")
+        style = mxcell.get("style", "")
+        label = cell.get("value", "") or cell.get("label", "")
         if label:
             label = self._clean_html(label)
 
@@ -371,17 +408,22 @@ class XmlParser:
             if cell_id not in node_map:
                 continue
             node = node_map[cell_id]
-            geometry = cell.find(".//mxGeometry")
+            geometry = self._find_geom(cell)
             if geometry is not None:
                 geometry.set("x", str(node.x))
                 geometry.set("y", str(node.y))
                 geometry.set("width", str(node.width))
                 geometry.set("height", str(node.height))
             if node.label:
-                cell.set("label", node.label)
-                mx_cell = cell.find(".//mxCell")
-                if mx_cell is not None:
-                    mx_cell.set("value", node.label)
+                # For bare mxCell: value attribute stores label
+                local = self._local_tag(cell.tag)
+                if local == "mxCell":
+                    cell.set("value", node.label)
+                else:
+                    cell.set("label", node.label)
+                    mx_cell = cell.find(".//mxCell")
+                    if mx_cell is not None:
+                        mx_cell.set("value", node.label)
 
         # Write directly — preserves original whitespace and attribute order
         xml_bytes = ET.tostring(self.root, encoding='utf-8', method='xml', xml_declaration=True)
@@ -397,7 +439,13 @@ def parse_drawio_file(file_path: str) -> DiagramData:
 
 def _update_cell_geometry(cell: ET.Element, x: float, y: float, width: float, height: float):
     """Update the geometry of a cell element."""
-    geometry = cell.find("mxGeometry")
+    # Search all descendants for mxGeometry (handles namespaced XML)
+    geometry = None
+    for child in cell.iter():
+        local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+        if local == "mxGeometry":
+            geometry = child
+            break
     if geometry is None:
         geometry = ET.SubElement(cell, "mxGeometry")
     

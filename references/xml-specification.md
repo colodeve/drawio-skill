@@ -31,7 +31,7 @@ carries the linking metadata, while the inner `<mxCell>` defines the visual appe
 | Attribute | Required | Description |
 |-----------|----------|-------------|
 | `label` | Yes | Display text shown on the diagram element. Keep concise. |
-| `hedietLinkedDataV1_path` | Yes | Relative path from the drawio file to the source file (note: path is resolved relative to the drawio FILE, not its directory). Use forward slashes. |
+| `hedietLinkedDataV1_path` | Yes | Relative path from the drawio file's directory to the source file. Note: vscode-drawio uses `path.join(drawioFilePath, path)` where `drawioFilePath` includes the filename, so the path is effectively relative to the drawio **file** (not its directory). This means you need one extra `../` compared to intuition. Example: drawio at `diagrams/arch.drawio`, source at `src/app.ts` → path = `../../src/app.ts`. Use forward slashes. |
 | `hedietLinkedDataV1_start_line_x-num` | Yes | Starting line number (0-indexed, matches VS Code `Position.line`). Use `0` if not yet linked. |
 | `hedietLinkedDataV1_end_line_x-num` | Yes | Ending line number (0-indexed, matches VS Code `Position.line`). Use `0` if not yet linked. |
 | `hedietLinkedDataV1_symbol` | No | Hierarchical symbol path (e.g. `ClassName.methodName`). Alternative to line range. |

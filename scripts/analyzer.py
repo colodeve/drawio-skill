@@ -618,6 +618,202 @@ def function_fingerprints(file_path: str) -> Dict[str, str]:
     return fps
 
 
+# ── extract_struct_fields ──────────────────────────────────────────
+
+@dataclass
+class StructField:
+    name: str
+    type_name: str = ""
+
+
+def extract_struct_fields(file_path: str) -> Dict[str, List[StructField]]:
+    """Extract struct/class definitions with their fields.
+
+    Supports C (struct), Python (class with annotations), Java/C#/TS (class fields).
+    Returns { struct_name: [StructField(name, type_name), ...], ... }
+    """
+    ext = os.path.splitext(file_path)[1].lower()
+    lang = EXT_LANG.get(ext)
+    if lang is None:
+        return {}
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            source = f.read()
+    except Exception:
+        return {}
+
+    if lang == "python":
+        return _extract_python_fields(source)
+
+    if lang in BRACE_LANGS:
+        return _extract_brace_fields(source, lang)
+
+    return {}
+
+
+def _extract_python_fields(source: str) -> Dict[str, List[StructField]]:
+    """Extract class fields using Python AST."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+
+    result: Dict[str, List[StructField]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        fields: List[StructField] = []
+        seen = set()
+        for item in ast.iter_child_nodes(node):
+            # Instance variable assignment: self.x = ...
+            if isinstance(item, ast.FunctionDef) and item.name == "__init__":
+                for stmt in ast.walk(item):
+                    if isinstance(stmt, ast.Assign):
+                        for target in stmt.targets:
+                            if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self":
+                                if target.attr not in seen:
+                                    seen.add(target.attr)
+                                    type_hint = ""
+                                    fields.append(StructField(name=target.attr, type_name=type_hint))
+            # Class-level annotation: x: int = 0
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                if item.target.id not in seen:
+                    seen.add(item.target.id)
+                    type_hint = _ast_to_type_str(item.annotation) if item.annotation else ""
+                    fields.append(StructField(name=item.target.id, type_name=type_hint))
+        if fields:
+            result[node.name] = fields
+    return result
+
+
+def _ast_to_type_str(annotation: ast.expr) -> str:
+    """Convert an AST type annotation to a readable string."""
+    if isinstance(annotation, ast.Name):
+        return annotation.id
+    if isinstance(annotation, ast.Subscript):
+        base = _ast_to_type_str(annotation.value)
+        slc = _ast_to_type_str(annotation.slice) if hasattr(annotation, 'slice') else ""
+        return f"{base}[{slc}]"
+    if isinstance(annotation, ast.Attribute):
+        return f"{_ast_to_type_str(annotation.value)}.{annotation.attr}"
+    if isinstance(annotation, ast.Constant):
+        return str(annotation.value)
+    if isinstance(annotation, ast.Tuple):
+        return ", ".join(_ast_to_type_str(e) for e in annotation.elts)
+    if isinstance(annotation, ast.Index):
+        return _ast_to_type_str(annotation.value)
+    return ""
+
+
+def _extract_brace_fields(source: str, lang: str) -> Dict[str, List[StructField]]:
+    """Extract struct/class fields from brace-delimited languages."""
+    # Strip string/comment content to avoid false matches
+    clean_source = _strip_comments(source, lang)
+    lines = clean_source.splitlines()
+
+    struct_re = _struct_pattern(lang)
+    if struct_re is None:
+        return {}
+
+    result: Dict[str, List[StructField]] = {}
+    i = 0
+    while i < len(lines):
+        m = re.search(struct_re, lines[i])
+        if not m:
+            i += 1
+            continue
+        struct_name = m.group(1)
+        # Find opening brace
+        brace_start = lines[i].find("{")
+        if brace_start == -1:
+            i += 1
+            continue
+        brace_depth = 1
+        fields: List[StructField] = []
+        field_lines: List[str] = []
+        j = i + 1
+        while j < len(lines) and brace_depth > 0:
+            line = lines[j]
+            for ch in line:
+                if ch == "{":
+                    brace_depth += 1
+                elif ch == "}":
+                    brace_depth -= 1
+            if brace_depth == 1:
+                field_lines.append(line)
+            elif brace_depth == 0 and field_lines:
+                # Extract field type/name from collected lines in this struct
+                for fl in field_lines:
+                    fl_stripped = fl.strip()
+                    if not fl_stripped:
+                        continue
+                    # Skip access specifiers, methods, comments
+                    if fl_stripped.startswith(("public:", "private:", "protected:",
+                                                "//", "/*", "*", "#")):
+                        continue
+                    # Skip lines that look like methods (have parentheses)
+                    if "(" in fl_stripped and ")" in fl_stripped:
+                        continue
+                    # Parse: optional modifiers + type + name
+                    f = _parse_c_field(fl_stripped)
+                    if f:
+                        fields.append(f)
+            j += 1
+
+        if fields:
+            result[struct_name] = fields
+        i = j if j > i else i + 1
+
+    return result
+
+
+def _struct_pattern(lang: str) -> Optional[str]:
+    """Get regex pattern for struct/class declaration header."""
+    c_like = {"c", "cpp", "hpp", "h", "cs", "java", "dart", "swift", "scala", "kotlin"}
+    ts_like = {"typescript", "tsx", "javascript", "jsx"}
+    go_rust = {"go", "rust"}
+
+    if lang in c_like:
+        return r"(?:typedef\s+)?(?:struct|class|union)\s+(\w+)"
+    if lang in ts_like:
+        return r"(?:export\s+|default\s+)?(?:class|interface|type)\s+(\w+)"
+    if lang == "go":
+        return r"(?:type\s+)?(\w+)\s+(?:struct|interface)\b"
+    if lang == "rust":
+        return r"(?:pub\s+)?(?:struct|enum|trait)\s+(\w+)"
+    return None
+
+
+def _parse_c_field(line: str) -> Optional[StructField]:
+    """Parse a C-like field declaration: 'type name;' or 'type name[N];'"""
+    # Remove trailing semicolon/braces
+    line = line.strip().rstrip(";").strip()
+    if not line:
+        return None
+    # Skip if it looks like a preprocessor directive, comment, or empty
+    if line.startswith(("#", "//", "/*", "*", "typedef", "using")):
+        return None
+    # Remove leading modifiers
+    for mod in ["static ", "const ", "volatile ", "extern ", "inline ",
+                "unsigned ", "signed ", "long ", "short "]:
+        if line.startswith(mod):
+            line = line[len(mod):]
+    # Remove trailing array notation: name[16] → name
+    m = re.match(r"(.+?)\s+(\w+)\s*(?:\[[^\]]*\])?\s*$", line)
+    if not m:
+        # Try bitfield: name : N
+        m = re.match(r"(.+?)\s+(\w+)\s*:\s*\d+\s*$", line)
+    if m:
+        type_name = m.group(1).strip()
+        field_name = m.group(2).strip()
+        # Skip if it's still a modifier or type keyword
+        if field_name.lower() in ("struct", "union", "enum", "typedef", "class"):
+            return None
+        return StructField(name=field_name, type_name=type_name)
+    return None
+
+
 def compare_function_fingerprints(old_fps: Dict[str, str],
                                    new_fps: Dict[str, str]) -> Dict[str, str]:
     """Compare two function fingerprint dicts.

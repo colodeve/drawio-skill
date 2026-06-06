@@ -14,12 +14,12 @@ A **style preset** is a named JSON file capturing visual preferences — palette
 
 ## Locations and Lookup Order
 
-1. `~/.drawio-skill/styles/<name>.json` — user presets (survive `git pull`)
+1. `~/.drawio-architect/styles/<name>.json` — user presets (survive `git pull`)
 2. `<this-skill-dir>/styles/built-in/<name>.json` — built-ins shipped with the skill (`default`, `corporate`, `handdrawn`)
 
 A user preset shadows a built-in of the same name.
 
-Only user presets can have `"default": true`. When the user says *"make `<built-in-name>` my default"*, copy the built-in JSON to `~/.drawio-skill/styles/<name>.json` first, then set `default: true` on the copy — leave the shipped built-in untouched.
+Only user presets can have `"default": true`. When the user says *"make `<built-in-name>` my default"*, copy the built-in JSON to `~/.drawio-architect/styles/<name>.json` first, then set `default: true` on the copy — leave the shipped built-in untouched.
 
 **Name normalization:** always lowercase the user-provided name before writing or looking up files (the preset schema enforces lowercase; uppercase names will fail validation).
 
@@ -90,7 +90,7 @@ Diagram-type presets set structural style keywords that the user preset must pre
    - The sample PNG
    - Provenance line
 6. **Wait for approval:**
-   - "save" / "looks good" → write candidate to `~/.drawio-skill/styles/<name>.json`
+   - "save" / "looks good" → write candidate to `~/.drawio-architect/styles/<name>.json`
    - "change `<field>` to `<value>`" → edit, re-render, re-ask
    - "cancel" → delete tempfile and sample PNG
 

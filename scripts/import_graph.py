@@ -13,7 +13,7 @@ from collections import defaultdict
 from typing import List, Dict, Set, Tuple, Optional
 from dataclasses import dataclass, field
 
-from scripts.analyzer import extract_imports, structure_hash, content_hash, classify_change
+from scripts.analyzer import extract_imports
 
 
 @dataclass
@@ -23,8 +23,6 @@ class ImportGraphNode:
     abs_path: str
     imports: List[str] = field(default_factory=list)   # paths this file imports
     imported_by: List[str] = field(default_factory=list)  # paths that import this
-    content_fingerprint: str = ""
-    structure_fingerprint: str = ""
 
 
 class ImportGraph:
@@ -36,12 +34,7 @@ class ImportGraph:
     def add_file(self, rel_path: str, abs_path: str):
         if rel_path in self.nodes:
             return
-        node = ImportGraphNode(
-            path=rel_path,
-            abs_path=abs_path,
-            content_fingerprint=content_hash(abs_path),
-            structure_fingerprint=structure_hash(abs_path),
-        )
+        node = ImportGraphNode(path=rel_path, abs_path=abs_path)
         self.nodes[rel_path] = node
 
     def add_import(self, from_path: str, to_path: str):
@@ -163,36 +156,58 @@ def build_import_graph(project_root: str, file_paths: List[str]) -> ImportGraph:
     return graph
 
 
+_HEADER_EXTS = {'.h', '.hpp', '.hh', '.hxx', '.d.ts', '.def'}
+_PRIMARY_EXTS = {'.c', '.cpp', '.cc', '.py', '.js', '.ts', '.java', '.go', '.rs',
+                 '.rb', '.php', '.cs', '.kt', '.swift', '.dart', '.scala', '.lua'}
+
+
+def _is_header(path: str) -> bool:
+    if path.endswith('.d.ts'):
+        return True
+    return os.path.splitext(path)[1].lower() in _HEADER_EXTS
+
+
+def _stem(path: str) -> str:
+    return os.path.splitext(os.path.basename(path))[0].lower()
+
+
 def suggest_edges(
     import_graph: ImportGraph,
     existing_nodes: List[Tuple[str, str]],    # [(node_id, file_path)]
+    max_edges: int = 30,
 ) -> List[Dict]:
     """
     Suggest edges between diagram nodes based on import relationships.
+    Filters to reduce noise: skips same-stem edges, skips header sources,
+    prefers cross-module edges, caps total edges.
 
     Args:
         import_graph: Built ImportGraph
         existing_nodes: List of (node_id, relative_file_path) from the diagram
+        max_edges: Maximum total edges to suggest (default 30)
 
     Returns:
         List of edge dicts: {from, to, label, style}
     """
-    # Build file → list of node_ids (one file can have multiple diagram nodes)
     file_to_nodes: Dict[str, List[str]] = {}
     for nid, fpath in existing_nodes:
         file_to_nodes.setdefault(fpath, []).append(nid)
 
-    edges: List[Dict] = []
+    candidates: List[tuple] = []
     seen_pairs: Set[Tuple[str, str]] = set()
 
     for rel_path, node in import_graph.nodes.items():
         src_ids = file_to_nodes.get(rel_path, [])
         if not src_ids:
             continue
+        if _is_header(rel_path):
+            continue
 
         for imported_path in node.imports:
             tgt_ids = file_to_nodes.get(imported_path, [])
             if not tgt_ids:
+                continue
+            if _is_header(imported_path) and _stem(rel_path) == _stem(imported_path):
                 continue
 
             for src_id in src_ids:
@@ -205,67 +220,34 @@ def suggest_edges(
                     seen_pairs.add(pair)
 
                     same_dir = os.path.dirname(rel_path) == os.path.dirname(imported_path)
-                    edges.append({
-                        "from": src_id,
-                        "to": tgt_id,
-                        "label": "imports" if same_dir else "depends on",
-                        "style": "solid" if same_dir else "dashed",
-                    })
+                    tgt_is_primary = not _is_header(imported_path)
+
+                    priority = 0
+                    if same_dir:
+                        priority -= 2
+                    if tgt_is_primary:
+                        priority -= 1
+
+                    candidates.append((
+                        priority,
+                        src_id,
+                        tgt_id,
+                        "imports" if same_dir else "depends on",
+                        "solid" if same_dir else "dashed",
+                    ))
+
+    candidates.sort(key=lambda x: x[0])
+    edges = []
+    for _, src_id, tgt_id, label, style in candidates[:max_edges]:
+        edges.append({
+            "from": src_id,
+            "to": tgt_id,
+            "label": label,
+            "style": style,
+        })
 
     return edges
 
 
-def compute_project_fingerprints(project_root: str, file_paths: List[str]) -> Dict[str, Dict]:
-    """
-    Compute content and structure fingerprints for all project files.
-    Returns dict mapping relative path → {content_hash, structure_hash, lines}.
-    """
-    result = {}
-    for fp in file_paths:
-        rel = os.path.relpath(fp, project_root).replace(os.sep, "/")
-        result[rel] = {
-            "content_hash": content_hash(fp),
-            "structure_hash": structure_hash(fp),
-            "lines": _count_lines(fp),
-        }
-    return result
-
-
-def _count_lines(file_path: str) -> int:
-    try:
-        with open(file_path, "rb") as f:
-            return sum(1 for _ in f)
-    except Exception:
-        return 0
-
-
-def detect_changed_files(
-    old_fingerprints: Dict[str, Dict],
-    new_fingerprints: Dict[str, Dict],
-) -> Dict[str, str]:
-    """
-    Compare old and new fingerprints to classify changes.
-
-    Returns: dict of rel_path → change_type ("new", "deleted", "structural", "cosmetic", "none")
-    """
-    changes: Dict[str, str] = {}
-
-    old_paths = set(old_fingerprints.keys())
-    new_paths = set(new_fingerprints.keys())
-
-    for path in new_paths - old_paths:
-        changes[path] = "new"
-    for path in old_paths - new_paths:
-        changes[path] = "deleted"
-
-    for path in old_paths & new_paths:
-        old = old_fingerprints[path]
-        new = new_fingerprints[path]
-        if old["content_hash"] == new["content_hash"]:
-            changes[path] = "none"
-        elif old["structure_hash"] == new["structure_hash"]:
-            changes[path] = "cosmetic"
-        else:
-            changes[path] = "structural"
-
-    return changes
+# (compute_project_fingerprints and detect_changed_files were removed
+#  in favor of git-diff based detection. See incremental_reader.py.)

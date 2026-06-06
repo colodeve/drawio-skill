@@ -90,9 +90,21 @@ def commit_and_return(project_root: str, message: str, branch: Optional[str] = N
 def changed_files(ref: str = "HEAD", project_root: str = ".") -> List[str]:
     """Get list of files changed since ref using git diff.
     
-    Returns file paths relative to project_root.
+    Returns file paths relative to project_root (tracked changes only).
+    Use untracked_files() for new untracked files.
     """
     ok, out = _run_git(["diff", "--name-only", ref], project_root)
+    if not ok:
+        return []
+    return [f.strip() for f in out.split("\n") if f.strip()]
+
+
+def untracked_files(project_root: str = ".") -> List[str]:
+    """Get list of untracked files (not yet staged/committed).
+    
+    Returns file paths relative to project_root.
+    """
+    ok, out = _run_git(["ls-files", "--others", "--exclude-standard"], project_root)
     if not ok:
         return []
     return [f.strip() for f in out.split("\n") if f.strip()]

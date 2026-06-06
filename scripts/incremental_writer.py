@@ -304,6 +304,9 @@ class IncrementalWriter:
             ".tsx": "typescript", ".jsx": "javascript",
             ".java": "java", ".go": "go", ".rs": "rust",
             ".rb": "ruby", ".php": "php",
+            ".c": "c", ".cpp": "cpp", ".h": "cpp", ".hpp": "cpp",
+            ".cs": "csharp", ".kt": "kotlin", ".swift": "swift",
+            ".sh": "bash",
         }.get(ext, "unknown")
 
     def _to_class_name(self, label: str) -> str:
