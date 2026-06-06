@@ -531,15 +531,20 @@ class IncrementalReader:
                 })
 
     def _build_l4_patch(self, changes: Dict[str, Any], patch: Dict[str, Any]):
-        """Data structures: only struct/class nodes with field members."""
+        """Data structures: struct/class nodes with field members and relationship edges."""
         structured = [f for f in changes.get('new_files', []) if f.get('members')]
         if not structured:
             return
 
         patch.setdefault('add_nodes', [])
+        # Build struct_name → node_id mapping for edge detection
+        struct_to_node: Dict[str, str] = {}
+        file_structs: Dict[str, Dict[str, List[str]]] = {}
+
         for f in structured:
+            nid = self._make_id_from_path(f['path'])
             patch['add_nodes'].append({
-                'id': self._make_id_from_path(f['path']),
+                'id': nid,
                 'label': self._make_label_from_path(f['path']),
                 'type': 'data',
                 'group': f.get('group', self._infer_group_from_path(f['path'])),
@@ -548,6 +553,59 @@ class IncrementalReader:
                 'members': f['members'],
                 'container': True,
             })
+
+            # Parse members into struct_name → list of (field_type, field_name)
+            structs_in_file: Dict[str, List[tuple]] = {}
+            current_struct = None
+            for line in f['members']:
+                sm = re.match(r'──\s*(\w+)\s*──', line)
+                if sm:
+                    current_struct = sm.group(1)
+                    structs_in_file[current_struct] = []
+                    struct_to_node[current_struct] = nid
+                elif current_struct and line.startswith('  '):
+                    m2 = re.match(r'  (.+?):\s*(.+)$', line)
+                    if m2:
+                        name = m2.group(1).strip()
+                        ftype = m2.group(2).strip()
+                        structs_in_file[current_struct].append((ftype, name))
+                    elif line.strip():
+                        name = line.strip()
+                        structs_in_file[current_struct].append(('', name))
+            if structs_in_file:
+                file_structs[f['path']] = structs_in_file
+
+        # Detect cross-file relationships: field type references another known struct
+        if struct_to_node and file_structs:
+            file_nid_for = {f['path']: self._make_id_from_path(f['path']) for f in structured}
+            seen_pairs: Set[tuple] = set()
+            for fpath, structs in file_structs.items():
+                src_file_nid = file_nid_for.get(fpath)
+                for sname, fields in structs.items():
+                    for ftype, fname in fields:
+                        tgt = self._resolve_struct_ref(ftype, struct_to_node)
+                        if not tgt:
+                            continue
+                        tgt_file = None
+                        for fp, sts in file_structs.items():
+                            if any(sn == tgt for sn in sts):
+                                tgt_file = fp
+                                break
+                        tgt_nid = struct_to_node.get(tgt)
+                        if not tgt_nid:
+                            continue
+                        # Skip self-references (same file)
+                        if tgt_file == fpath:
+                            continue
+                        pair = (src_file_nid, tgt_nid) if src_file_nid < tgt_nid else (tgt_nid, src_file_nid)
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            is_ptr = '*' in ftype
+                            label = '引用' if is_ptr else '包含'
+                            patch.setdefault('add_edges', []).append({
+                                'from': src_file_nid, 'to': tgt_nid,
+                                'label': label, 'style': 'solid',
+                            })
 
         # If existing diagram, update struct nodes whose file changed
         if changes.get('modified_files') and self.existing_data:
@@ -561,6 +619,31 @@ class IncrementalReader:
                             'id': node.id,
                             'members': new_fields,
                         })
+
+    def _resolve_struct_ref(self, type_str: str, struct_to_node: Dict[str, str]) -> Optional[str]:
+        """Extract referenced struct name from a field type string."""
+        # Handle: "struct spinlock" → "spinlock"
+        type_str = type_str.strip().split('[')[0].strip()  # remove array suffix
+        # Direct match
+        if type_str in struct_to_node:
+            return type_str
+        # "struct X" / "enum X" → extract X
+        for prefix in ('struct ', 'enum ', 'union ', 'class '):
+            if type_str.startswith(prefix):
+                name = type_str[len(prefix):].strip()
+                # Strip pointer/array decorations
+                name = name.split('[')[0].rstrip('*').strip()
+                if name in struct_to_node:
+                    return name
+        # Pointer: "spinlock*" or "struct spinlock *" → extract core name
+        core = type_str.rstrip('*').strip()
+        if core in struct_to_node:
+            return core
+        # Check if any known struct name is mentioned in the type
+        for known in struct_to_node:
+            if known in type_str:
+                return known
+        return None
 
     def _apply_layout(self, patch: Dict[str, Any]):
         has_existing = bool(self.existing_data and self.existing_data.nodes)
