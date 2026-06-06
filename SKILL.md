@@ -14,48 +14,103 @@ drawio文件画架构图，并同步架构图和代码，**绝不手写 XML**—
 
 ---
 
-## 工作流选择
+## 四层架构图（L1-L4）
 
-| 用户意图 | 工作流 | 详细参考 |
-|---|---|---|
-| "从代码生成图" / "代码变了更新图" | **增量读取** | `references/incremental-workflows.md` — Step 1-6 |
-| "基于 git diff 精准检测代码变更" | **git-diff 模式** | `scripts/incremental_reader.py --git-diff` |
-| "设计新模块" / "从图表生成代码" | **增量写入** | `references/incremental-workflows.md` — 下半部分 |
-| "把这个 YAML 画成图" | **直接生成** | `scripts/layout_generator.py --input --output` |
-| "换个样式/颜色" | 样式预设 | `references/style-presets.md` |
-| "导出 PNG/SVG" | 导出 | `references/export-commands.md` |
-
-> **不知道先读什么？** 先读 `references/incremental-workflows.md`，它覆盖了最常用的两种场景。
+| 层级 | 名称 | 生成方式 | 增量更新 |
+|------|------|---------|---------|
+| **L1** | 系统上下文 | `--level L1 --generate` 自动生成 + AI 补充 | 扫描新外部依赖 |
+| **L2** | 模块架构 | **AI 从扫描报告设计**，手动写 YAML | 扫描文件变化，AI 调整图 |
+| **L3** | 组件细节 | **AI 从扫描报告设计**，手动写 YAML | 代码变化后 AI 重审 |
+| **L4** | 数据结构 | `--level L4 --generate` 自动生成 + AI 改关系边 | struct 变化后重新生成 |
 
 ---
 
-## YAML 输出格式
+## 工作流
+
+### 第一步：获取扫描报告
+
+```bash
+# 完整报告（AI 读）
+python3 scripts/incremental_reader.py --project-root . --scan --output report.yaml
+```
+
+报告包含：
+- `files` — 源文件列表（路径/类型/行数/是否有 struct），**AI 判断哪些文件需要画成 L2 节点**
+- `import_relations` — 原始 import 依赖（**AI 决定哪些有意义**，不是全部画边）
+- `directories` — 目录结构
+- `struct_data` — struct/class 字段定义（L4 参考）
+- `l1_externals` — 系统外部依赖
+
+### 第二步：AI 设计各层图
+
+**L2（模块架构）** — AI 根据报告手动写 YAML：
+- 节点**不是**1:1对应文件。一个文件可能产生0/1/多个节点，多个文件可能合并为一个节点
+- 文件列表只作为参考，AI 根据代码分析决定模块边界
+- **边由 AI 设计**，用精炼标签描述关系（如"调度"、"读写"、"调用"），不用 import
+- 每个节点前几行是 AI 写的简短描述
+- 参见 `references/architecture-levels.md` 详细指导
+
+**L3（组件细节）** — AI 为关键模块单独写 YAML：
+- 内部逻辑流、状态机、调用链（if/while/条件分支）
+- 大量使用 `notes` 作为设计注释
+- 节点内容更详细，包含代码片段引用
+- 引用 L2 节点 ID 保持跨图一致性
+
+**L4（数据结构）** — 脚本自动生成 + AI 调整：
+```bash
+# 自动生成 struct/class 节点
+python3 scripts/incremental_reader.py --scan --level L4 --generate --output diagrams/structs.drawio
+```
+- AI 在 YAML 上增删节点，添加关系边（类似 ER 图）
+
+**L1（系统上下文）** — 脚本自动生成 + AI 补充：
+```bash
+python3 scripts/incremental_reader.py --scan --level L1 --generate --output diagrams/context.drawio
+```
+
+---
+
+## YAML 输出格式（AI 写）
 
 ```yaml
 nodes:
   - id: scheduler
-    label: scheduler()
+    label: 进程调度器
+    description: "管理 xv6 所有进程状态。\n核心函数: scheduler(), yield(), sleep(), wakeup()"  # AI 写
     type: controller
     group: proc_mgmt
-    path: ../kernel/proc.c
-    lines: [424, 691]        # 0-indexed
+    path: kernel/proc.c
+    lines: [424, 691]
     container: true
     members:
-      - "Round-robin: iterates proc[]"
-      - "Calls swtch() to context-switch"
-    scale: 1.0                # 1.0=普通，1.5=突出，0.7=紧凑
+      - "scheduler(): 轮转调度"
+      - "yield(): 主动让出 CPU"
+      - "sleep(): 等待事件"
+      - "wakeup(): 唤醒进程"
+
+  - id: allocator
+    label: 物理内存分配器
+    description: "基于空闲链表的页分配器\n每个 CPU 核心独立空闲链表减少锁竞争"  # AI 写
+    type: service
+    group: core
+    path: kernel/kalloc.c
+    lines: [0, 81]
 
 notes:
-  - text: "自动缩放文字"
+  - text: "xv6 调度策略：轮转法\n每次时钟中断触发 yield\n就绪队列是 proc 数组的线性扫描"
     group: proc_mgmt
-    width: 200
+    width: 280
     height: 80
 
-edges:
+edges:           # AI 设计边，用精炼描述性标签
   - from: scheduler
-    to: allocproc
-    label: swtch
-    style: dashed
+    to: allocator
+    label: 分配进程栈
+    style: solid
+  - from: scheduler
+    to: vm
+    label: 切换地址空间
+    style: solid
 
 layout:
   algorithm: layered
@@ -63,85 +118,41 @@ layout:
   preserve_existing: true
 ```
 
-**完整格式规范** → `references/structured-output-format.md`
-**布局算法详解** → `references/layout-system.md`
-
 ---
 
 ## 路径计算规则
 
-vscode-drawio 使用 `path.join(drawioFilePath, path)` 解析路径，文件名也算一个路径段。
+YAML 中的 `path` 写**相对于 drawio 文件所在目录**的路径。脚本写入 XML 时会自动加一层 `../` 补偿 vscode-drawio 的路径解析行为。
 
-| drawio 位置 | 代码位置 | path |
+| drawio 位置 | 代码位置 | YAML path |
 |---|---|---|
-| `根目录/arch.drawio` | `src/app.ts` | `../src/app.ts` |
-| `diagrams/arch.drawio` | `src/app.ts` | `../../src/app.ts` |
-
-> 脚本的 `_fix_hediet_path()` 写入 XML 时会自动处理。但 YAML 中仍需按此规则填写。
-
-> **运行脚本时**：本 skill 安装于 `~/.opencode/skills/drawio-skill-enhanced/`。使用 `python3 <skill-path>/scripts/<script>.py` 运行，或用相对路径 `scripts/<script>.py`（需在 skill 目录下执行）。所有脚本的 import 路径已自动处理。
+| `根目录/arch.drawio` | `src/app.ts` | `src/app.ts` |
+| `diagrams/arch.drawio` | `src/app.ts` | `../src/app.ts` |
 
 ---
 
 ## 多语言支持
 
-节点上的显示文本（label、members、notes.text、group label）可以跟随用户使用的语言。
-但标识性字段必须保持英文/数字，不随语言变化。
+节点上的显示文本可以跟随用户使用的语言。标识性字段保持英文/数字。
 
-### 可本地化（根据用户语言翻译）
+### 可本地化
+`nodes[].label`, `members`, `description`, `notes[].text`, `groups[].label`, `edges[].label`
 
-| 字段 | 说明 |
-|------|------|
-| `nodes[].label` | 节点显示名 |
-| `nodes[].members` | 容器内子文本行 |
-| `nodes[].description` | 描述 |
-| `notes[].text` | 注释框内容 |
-| `groups[].label` | 泳道标题 |
-| `edges[].label` | 边标签 |
-
-### 保持英文（不翻译）
-
-| 字段 | 理由 |
-|------|------|
-| `id` | 被 `from`/`to` 引用，必须全局稳定 |
-| `path` | 文件系统路径，必须匹配实际路径 |
-| `lines` | 行号，数字与语言无关 |
-| `type` | 映射到 draw.io 颜色/形状的标识符 |
-| `container`, `scale` | 布尔值/数值 |
-| `from`, `to` | 边引用节点 ID |
-| `style` | `solid`/`dashed` |
-| `layout.*` | 算法名、间距 |
-| `action` | `create`/`patch`/`scaffold` |
-
-### 示例
-
-```yaml
-nodes:
-  - id: user_svc          # 保持英文
-    label: 用户服务        # 翻译
-    type: service          # 保持英文
-    path: ../src/svc.ts    # 保持英文
-    lines: [0, 119]        # 保持数字
-```
-
-### 原理
-
-draw.io XML 中的 `label`/`value` 只影响画布上显示的文本，不影响功能。
-`path` 和 `lines` 由 vscode-drawio 扩展的 `CodePosition.deserialize()` 解析，需要精确匹配文件系统和 0-indexed 行号。
-`id` 被 `edges[].from/to` 引用，必须全局稳定。
+### 保持英文
+`id`, `path`, `lines`, `type`, `container`, `scale`, `from`, `to`, `style`, `layout.*`, `action`
 
 ---
 
 ## 类型颜色映射
 
-| type | 颜色 | 形状 | 适用文件 |
+| type | 颜色 | 形状 | 适用场景 |
 |---|---|---|---|
-| `entry`, `config` | 橙 | rounded | main、index、配置文件 |
-| `service`, `logic` | 蓝 | rounded | 业务逻辑、服务类 |
-| `data`, `model`, `database` | 绿 | cylinder | 数据模型、SQL、GraphQL |
-| `external`, `api` | 红 | hexagon | 外部 API、第三方 |
-| `controller`, `ui` | 紫 | rounded | 控制器、UI 组件 |
-| `infrastructure`, `middleware` | 靛 | rounded | Dockerfile、Makefile、CI 配置 |
+| `entry`, `config` | 橙 | rounded | 入口、配置 |
+| `service`, `logic` | 蓝 | rounded | 业务逻辑 |
+| `data`, `model`, `database` | 绿 | cylinder | 数据模型 |
+| `external`, `api` | 红 | hexagon | 外部依赖 |
+| `controller`, `ui` | 紫 | rounded | 控制器 |
+| `infrastructure`, `middleware` | 靛 | rounded | 基础设施 |
 | `gateway` | 金 | rounded | 网关 |
 | `queue` | 黄 | rounded | 消息队列 |
 | `decision` | 橙 | rhombus | 判断节点 |
@@ -150,31 +161,32 @@ draw.io XML 中的 `label`/`value` 只影响画布上显示的文本，不影响
 
 ---
 
-## 脚本工具参考
+## 脚本工具
 
-| 脚本 | 用途 | 详细参考 |
-|---|---|---|
-| `incremental_reader.py` | 扫描代码变更，增量更新图。支持 `--diff`（指纹）和 `--git-diff`（git 精确 diff）两种模式 | `references/tool-reference.md` + `references/incremental-workflows.md` |
-| `git_diff_reader.py` | git diff 封装 + drawio XML diff 解析，被 `--git-diff` 自动调用 | `references/tool-reference.md` |
-| `incremental_writer.py` | 从图生成/更新代码骨架（智能合并） | `references/tool-reference.md` + `references/incremental-workflows.md` |
-| `layout_generator.py` | YAML → drawio XML（布局+边路由+容器节点） | `references/tool-reference.md` |
-| `analyzer.py` | 代码块查找 + 函数级指纹（15+ 语言） | `references/tool-reference.md` |
-| `import_graph.py` | import 依赖图分析（自动被 `--diff` 调用） | `references/tool-reference.md` |
-| `code_sync.py` | 同步图中的行号 | `references/tool-reference.md` |
-| `export_diagram.py` | 导出 PNG/SVG/PDF | `references/export-commands.md` |
-| `index_generator.py` | 刷新 `.vscode/drawio-code-links.json` | 自动调用 |
-| `layout_analyzer.py` | 布局验证 | `references/tool-reference.md` |
+| 脚本 | 用途 |
+|---|---|
+| `incremental_reader.py` | 扫描代码，输出报告(`.yaml`)。L4/L1 可用 `--generate` 自动生成 |
+| `incremental_writer.py` | 从图生成/更新代码骨架（智能合并） |
+| `layout_generator.py` | YAML → drawio XML（布局+边路由+容器节点+notes） |
+| `analyzer.py` | 代码块查找、import 提取、struct 字段提取 |
+| `import_graph.py` | import 依赖图分析 |
+| `git_diff_reader.py` | git diff 封装 |
+| `index_generator.py` | 刷新 `.vscode/drawio-code-links.json` |
+| `export_diagram.py` | 导出 PNG/SVG/PDF |
+| `layout_analyzer.py` | 布局验证 |
+| `code_sync.py` | 同步图中的行号 |
 
 ---
 
 ## 关键提醒
 
 - **不要手写 XML** → 永远输出 YAML
-- **路径规则** → 比直觉多一层 `../`
-- **容器子节点不写 path/lines** → 只写 `members`
+- **L2/L3 是 AI 设计** → 扫描报告只是素材，节点/边/描述由 AI 决定
+- **L4 自动生成 struct/class 节点** → AI 在 YAML 上加关系边、删多余节点
+- **路径规则** → YAML 填相对 drawio **目录**的路径，脚本自动补偿
+- **容器子节点不写 path/lines** → 只写 `members`，同时设置 `container: true`
 - **行号 0-indexed** → 第一行是 line 0
-- **增量优先** → 已有项目用 `preserve_existing: true` patch
 - **文件已存在时不覆盖** → 脚本智能合并 import + method
 - **非代码文件也支持** → Dockerfile、Makefile、CI YAML、SQL、配置文件都会被索引
-- **git-diff 模式** → 用 `--git-diff` 替代 `--diff` 可获得更精确的变更内容（AI 能看到实际的 + 行/- 行），工程项目建议使用此模式
-- **首次使用** → 先读 `references/incremental-workflows.md`
+- **`--scan` 自动选择** → git 项目走 git-diff（O(变更数)），非 git 走文件哈希缓存
+- **首次使用** → 先写 `references/architecture-levels.md`
